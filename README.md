@@ -50,6 +50,9 @@ Studio 会识别顶层 `CMakeLists.txt`。
   算子节点、forward graph 构建和单线程标量执行。
 - `stage08_graph_kv_store`：I32 cell 索引、`SET_ROWS` 散写节点，以及跨多次
   graph compute 长期存在的 K/V Tensor。
+- `stage09_graph_attention`：Q/K RoPE、物理 cell mask、显式 KV 写入顺序，
+  以及从持久缓存读取历史 K/V 的单头 Attention 图。
 
 第七阶段开始从“数学功能相同”收紧为“核心执行结构对齐”。第八阶段把临时图和
-持久 KV 数据区接通；下一步让 Attention 从缓存读取历史 K/V。
+持久 KV 数据区接通；第九阶段已经让 Attention 从缓存读取历史 K/V。下一步把
+cell/sequence 元数据接入图构建，自动生成写入位置和 mask。

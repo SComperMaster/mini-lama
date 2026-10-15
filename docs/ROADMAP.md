@@ -19,6 +19,7 @@
 | Prompt reuse | 请求 token 匹配和 `seq_cp` |
 | 最小计算图 | `ggml_tensor::op/src`、`ggml_cgraph`、forward graph compute |
 | 图写入 KV | `ggml_set_rows`、`cpy_k/cpy_v`、持久 cache Tensor |
+| 图读取 KV | RoPE、Attention mask、`get_k/get_v` 和显式写后读顺序 |
 | GGUF reader | model loader 和 GGUF metadata |
 | Q8/Q4 | ggml quantization types |
 | backend 替换 | ggml graph、allocator、backend |

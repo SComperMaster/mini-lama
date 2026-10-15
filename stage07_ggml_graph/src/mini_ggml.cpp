@@ -101,17 +101,17 @@ void compute_mul_mat(Tensor& output) {
     }
 }
 
-float read_epsilon(const Tensor& tensor) {
-    float epsilon = 0.0F;
-    static_assert(sizeof(epsilon) <= sizeof(tensor.op_params));
-    std::memcpy(&epsilon, tensor.op_params.data(), sizeof(epsilon));
-    return epsilon;
+float read_float_param(const Tensor& tensor) {
+    float value = 0.0F;
+    static_assert(sizeof(value) <= sizeof(tensor.op_params));
+    std::memcpy(&value, tensor.op_params.data(), sizeof(value));
+    return value;
 }
 
 void compute_rms_norm(Tensor& output) {
     const Tensor& input = *output.src[0];
     const std::size_t row_width = extent(input.ne[0]);
-    const float epsilon = read_epsilon(output);
+    const float epsilon = read_float_param(output);
 
     for (std::size_t i3 = 0; i3 < extent(input.ne[3]); ++i3) {
         for (std::size_t i2 = 0; i2 < extent(input.ne[2]); ++i2) {
@@ -128,6 +128,76 @@ void compute_rms_norm(Tensor& output) {
                         input.at(i0, i1, i2, i3) * inverse_rms;
                 }
             }
+        }
+    }
+}
+
+void compute_rope(Tensor& output) {
+    const Tensor& input = *output.src[0];
+    const Tensor& positions = *output.src[1];
+    const std::size_t head_dim = extent(input.ne[0]);
+    const float theta = read_float_param(output);
+
+    for (std::size_t token = 0; token < extent(input.ne[1]); ++token) {
+        const std::int32_t position_i32 = positions.at_i32(token);
+        if (position_i32 < 0) {
+            throw std::invalid_argument("RoPE positions must be non-negative");
+        }
+        const float position = static_cast<float>(position_i32);
+        for (std::size_t dimension = 0; dimension < head_dim; dimension += 2) {
+            const float exponent =
+                -static_cast<float>(dimension) / static_cast<float>(head_dim);
+            const float frequency = std::pow(theta, exponent);
+            const float angle = position * frequency;
+            const float cosine = std::cos(angle);
+            const float sine = std::sin(angle);
+            const float even = input.at(dimension, token);
+            const float odd = input.at(dimension + 1, token);
+            output.at(dimension, token) = even * cosine - odd * sine;
+            output.at(dimension + 1, token) = even * sine + odd * cosine;
+        }
+    }
+}
+
+void compute_attention(Tensor& output) {
+    const Tensor& query = *output.src[0];
+    const Tensor& key = *output.src[1];
+    const Tensor& value = *output.src[2];
+    const Tensor& mask = *output.src[3];
+    const std::size_t head_dim = extent(query.ne[0]);
+    const std::size_t cache_capacity = extent(key.ne[1]);
+    const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
+    std::vector<float> scores(cache_capacity, 0.0F);
+
+    for (std::size_t token = 0; token < extent(query.ne[1]); ++token) {
+        float maximum = -std::numeric_limits<float>::infinity();
+        for (std::size_t cell = 0; cell < cache_capacity; ++cell) {
+            float dot = 0.0F;
+            for (std::size_t dimension = 0; dimension < head_dim; ++dimension) {
+                dot += query.at(dimension, token) * key.at(dimension, cell);
+            }
+            scores[cell] = dot * scale + mask.at(cell, token);
+            maximum = std::max(maximum, scores[cell]);
+        }
+        if (!std::isfinite(maximum)) {
+            throw std::invalid_argument("Attention mask hides every KV cell");
+        }
+
+        float sum = 0.0F;
+        for (float& score : scores) {
+            score = std::isfinite(score) ? std::exp(score - maximum) : 0.0F;
+            sum += score;
+        }
+        if (!(sum > 0.0F)) {
+            throw std::runtime_error("Attention softmax has an invalid sum");
+        }
+
+        for (std::size_t dimension = 0; dimension < head_dim; ++dimension) {
+            float weighted_value = 0.0F;
+            for (std::size_t cell = 0; cell < cache_capacity; ++cell) {
+                weighted_value += (scores[cell] / sum) * value.at(dimension, cell);
+            }
+            output.at(dimension, token) = weighted_value;
         }
     }
 }
@@ -363,6 +433,9 @@ Tensor* Context::mul(Tensor* left, Tensor* right, std::string name) {
 Tensor* Context::mul_mat(Tensor* weights, Tensor* input, std::string name) {
     require_tensor(weights, "weights");
     require_tensor(input, "input");
+    if (weights->type != Type::f32 || input->type != Type::f32) {
+        throw std::invalid_argument("mul_mat requires F32 tensors");
+    }
     if (weights->n_dims() > 2 || input->n_dims() > 2) {
         throw std::invalid_argument("stage07 mul_mat only supports 2D tensors");
     }
@@ -389,6 +462,32 @@ Tensor* Context::rms_norm(Tensor* input, const float epsilon, std::string name) 
     result->op = Op::rms_norm;
     result->src[0] = input;
     std::memcpy(result->op_params.data(), &epsilon, sizeof(epsilon));
+    return result;
+}
+
+Tensor* Context::rope(
+    Tensor* input,
+    Tensor* positions,
+    const float theta,
+    std::string name) {
+    require_tensor(input, "RoPE input");
+    require_tensor(positions, "RoPE positions");
+    if (input->type != Type::f32 || positions->type != Type::i32) {
+        throw std::invalid_argument("RoPE requires F32 input and I32 positions");
+    }
+    if (input->n_dims() > 2 || positions->n_dims() != 1 ||
+        input->ne[1] != positions->ne[0] || input->ne[0] % 2 != 0) {
+        throw std::invalid_argument("RoPE shapes require even head_dim and one position per token");
+    }
+    if (!(theta > 0.0F)) {
+        throw std::invalid_argument("RoPE theta must be positive");
+    }
+
+    Tensor* result = new_tensor(Type::f32, input->ne, std::move(name));
+    result->op = Op::rope;
+    result->src[0] = input;
+    result->src[1] = positions;
+    std::memcpy(result->op_params.data(), &theta, sizeof(theta));
     return result;
 }
 
@@ -427,6 +526,36 @@ Tensor* Context::set_rows(
 
     Tensor* result = tensor.get();
     tensors_.push_back(std::move(tensor));
+    return result;
+}
+
+Tensor* Context::attention(
+    Tensor* query,
+    Tensor* key_cache,
+    Tensor* value_cache,
+    Tensor* mask,
+    std::string name) {
+    require_tensor(query, "Attention query");
+    require_tensor(key_cache, "Attention key cache");
+    require_tensor(value_cache, "Attention value cache");
+    require_tensor(mask, "Attention mask");
+    if (query->type != Type::f32 || key_cache->type != Type::f32 ||
+        value_cache->type != Type::f32 || mask->type != Type::f32) {
+        throw std::invalid_argument("Attention requires F32 tensors");
+    }
+    if (query->n_dims() > 2 || key_cache->n_dims() > 2 ||
+        value_cache->n_dims() > 2 || mask->n_dims() > 2 ||
+        key_cache->ne != value_cache->ne || query->ne[0] != key_cache->ne[0] ||
+        mask->ne[0] != key_cache->ne[1] || mask->ne[1] != query->ne[1]) {
+        throw std::invalid_argument("Attention tensor shapes do not match");
+    }
+
+    Tensor* result = new_tensor(Type::f32, query->ne, std::move(name));
+    result->op = Op::attention;
+    result->src[0] = query;
+    result->src[1] = key_cache;
+    result->src[2] = value_cache;
+    result->src[3] = mask;
     return result;
 }
 
@@ -495,8 +624,14 @@ void graph_compute(Graph& graph) {
         case Op::rms_norm:
             compute_rms_norm(*node);
             break;
+        case Op::rope:
+            compute_rope(*node);
+            break;
         case Op::set_rows:
             compute_set_rows(*node);
+            break;
+        case Op::attention:
+            compute_attention(*node);
             break;
         case Op::none:
             throw std::logic_error("A leaf Tensor was incorrectly placed in graph.nodes");
@@ -512,7 +647,9 @@ const char* op_name(const Op op) noexcept {
     case Op::mul: return "MUL";
     case Op::mul_mat: return "MUL_MAT";
     case Op::rms_norm: return "RMS_NORM";
+    case Op::rope: return "ROPE";
     case Op::set_rows: return "SET_ROWS";
+    case Op::attention: return "ATTENTION";
     }
     return "UNKNOWN";
 }

@@ -29,7 +29,9 @@ enum class Op {
     mul,
     mul_mat,
     rms_norm,
+    rope,
     set_rows,
+    attention,
 };
 
 struct Tensor {
@@ -100,6 +102,11 @@ public:
     Tensor* mul(Tensor* left, Tensor* right, std::string name = {});
     Tensor* mul_mat(Tensor* weights, Tensor* input, std::string name = {});
     Tensor* rms_norm(Tensor* input, float epsilon, std::string name = {});
+    Tensor* rope(
+        Tensor* input,
+        Tensor* positions,
+        float theta = 10000.0F,
+        std::string name = {});
 
     // 对应 ggml_set_rows(destination, source, row_indices)。返回值与 destination
     // 共享 storage；执行节点时才把 source 的每一行散写到指定物理行。
@@ -107,6 +114,15 @@ public:
         Tensor* destination,
         Tensor* source,
         Tensor* row_indices,
+        std::string name = {});
+
+    // 单头教学版 Attention。mask 的形状为 [cache_capacity, query_tokens]，
+    // 可见位置填 0，不可见位置填 -infinity。
+    Tensor* attention(
+        Tensor* query,
+        Tensor* key_cache,
+        Tensor* value_cache,
+        Tensor* mask,
         std::string name = {});
 
 private:

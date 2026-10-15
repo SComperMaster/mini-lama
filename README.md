@@ -13,8 +13,9 @@ llama.cpp，而是先实现正确、容易阅读的版本，再逐步加入 KV C
 5. `stage05_kv_cells`：实现接近 llama.cpp 的 cell、sequence 和槽位复用。
 6. `stage06_prompt_reuse`：公共前缀匹配并复用已有 KV cells。
 7. `stage07_ggml_graph`：实现 `ne/nb`、view、算子节点、建图和标量执行器。
-8. `stage08_graph_llama_block`：使用计算图重新搭建 Llama Block。
-9. 后续阶段：对齐 KV prepare/apply，再加入简化 GGUF、量化与 backend。
+8. `stage08_graph_kv_store`：用 `SET_ROWS` 连接临时 Q/K/V 图和持久 KV Cache。
+9. `stage09_graph_attention`：加入 RoPE 和读取缓存的 Attention 图。
+10. 后续阶段：完整 graph Llama Block、KV prepare/apply、GGUF、量化与 backend。
 
 每个阶段都必须满足：能独立编译、能运行测试、能与参考结果比较。
 
@@ -47,6 +48,8 @@ Studio 会识别顶层 `CMakeLists.txt`。
   suffix-only 计算和安全释放。
 - `stage07_ggml_graph`：GGML 风格 `ne/nb` 布局、共享 storage 的 view、惰性
   算子节点、forward graph 构建和单线程标量执行。
+- `stage08_graph_kv_store`：I32 cell 索引、`SET_ROWS` 散写节点，以及跨多次
+  graph compute 长期存在的 K/V Tensor。
 
-第七阶段开始从“数学功能相同”收紧为“核心执行结构对齐”。下一步会用这套计算图
-重新搭建 Llama Block，然后把 KV Cache 接入 graph/context decode 路径。
+第七阶段开始从“数学功能相同”收紧为“核心执行结构对齐”。第八阶段把临时图和
+持久 KV 数据区接通；下一步让 Attention 从缓存读取历史 K/V。

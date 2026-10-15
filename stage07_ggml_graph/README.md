@@ -23,7 +23,7 @@ Tensor 节点，真正的计算由 forward graph executor 完成。
 
 ## 本阶段刻意省略
 
-- F16、BF16 和量化类型；
+- F16、BF16 和量化类型（I32 只用于下一阶段的行索引）；
 - backend buffer 与 graph allocator；
 - SIMD、多线程、CUDA 等 kernel；
 - in-place 算子和完整广播规则；
@@ -44,5 +44,5 @@ Tensor 节点，真正的计算由 forward graph executor 完成。
 executor 按顺序运行每个节点的 kernel
 ```
 
-下一阶段会用这里的图接口重新搭建一个 Llama Block。届时模型代码负责“描述
-计算”，executor 才负责“执行计算”。
+下一阶段先加入 `SET_ROWS`，展示临时 Q/K/V 图怎样把 K/V 写入长期 Cache；
+之后再用图接口重新搭建完整 Llama Block。

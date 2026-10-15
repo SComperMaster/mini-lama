@@ -15,10 +15,10 @@ constexpr std::size_t max_dims = 4;
 constexpr std::size_t max_sources = 4;
 constexpr std::size_t max_op_params = 8;
 
-// 这一阶段只实现 F32，但保留 type 字段，因为真实 ggml_tensor 的布局和
-// 后端选择都依赖它。
+// F32 用于模型数据；I32 先用于 SET_ROWS 的物理 cell 索引。
 enum class Type {
     f32,
+    i32,
 };
 
 // 对应 ggml_op 的最小子集。NONE 表示叶子 Tensor，不需要执行计算。
@@ -29,6 +29,7 @@ enum class Op {
     mul,
     mul_mat,
     rms_norm,
+    set_rows,
 };
 
 struct Tensor {
@@ -60,10 +61,22 @@ struct Tensor {
         std::size_t i2 = 0,
         std::size_t i3 = 0) const;
 
+    std::int32_t& at_i32(
+        std::size_t i0,
+        std::size_t i1 = 0,
+        std::size_t i2 = 0,
+        std::size_t i3 = 0);
+    const std::int32_t& at_i32(
+        std::size_t i0,
+        std::size_t i1 = 0,
+        std::size_t i2 = 0,
+        std::size_t i3 = 0) const;
+
 private:
     friend class Context;
 
-    std::shared_ptr<std::vector<float>> storage;
+    std::shared_ptr<std::vector<float>> f32_storage;
+    std::shared_ptr<std::vector<std::int32_t>> i32_storage;
     std::size_t storage_offset_bytes = 0;
 };
 
@@ -73,6 +86,7 @@ class Context {
 public:
     Tensor* new_tensor_1d(std::int64_t ne0, std::string name = {});
     Tensor* new_tensor_2d(std::int64_t ne0, std::int64_t ne1, std::string name = {});
+    Tensor* new_i32_tensor_1d(std::int64_t ne0, std::string name = {});
 
     Tensor* view_2d(
         Tensor* source,
@@ -87,8 +101,17 @@ public:
     Tensor* mul_mat(Tensor* weights, Tensor* input, std::string name = {});
     Tensor* rms_norm(Tensor* input, float epsilon, std::string name = {});
 
+    // 对应 ggml_set_rows(destination, source, row_indices)。返回值与 destination
+    // 共享 storage；执行节点时才把 source 的每一行散写到指定物理行。
+    Tensor* set_rows(
+        Tensor* destination,
+        Tensor* source,
+        Tensor* row_indices,
+        std::string name = {});
+
 private:
     Tensor* new_tensor(
+        Type type,
         std::array<std::int64_t, max_dims> ne,
         std::string name);
     Tensor* new_elementwise_node(
@@ -110,6 +133,7 @@ struct Graph {
 };
 
 void set_values(Tensor* tensor, std::initializer_list<float> values);
+void set_i32_values(Tensor* tensor, std::initializer_list<std::int32_t> values);
 
 // 从输出 Tensor 递归访问 src，构建 forward graph。共享子图只记录一次。
 void build_forward_expand(Graph& graph, Tensor* output);

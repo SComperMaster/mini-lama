@@ -10,7 +10,13 @@
 namespace mini_llama::ggml {
 namespace {
 
-constexpr std::size_t type_size = sizeof(float);
+std::size_t type_size(const Type type) {
+    switch (type) {
+    case Type::f32: return sizeof(float);
+    case Type::i32: return sizeof(std::int32_t);
+    }
+    throw std::logic_error("Unknown Tensor type");
+}
 
 std::size_t extent(const std::int64_t value) {
     if (value <= 0) {
@@ -126,6 +132,23 @@ void compute_rms_norm(Tensor& output) {
     }
 }
 
+void compute_set_rows(Tensor& output) {
+    const Tensor& source = *output.src[0];
+    const Tensor& row_indices = *output.src[1];
+
+    for (std::size_t source_row = 0; source_row < extent(source.ne[1]); ++source_row) {
+        const std::int32_t destination_row_i32 = row_indices.at_i32(source_row);
+        if (destination_row_i32 < 0 || destination_row_i32 >= output.ne[1]) {
+            throw std::out_of_range("SET_ROWS destination row is outside the cache");
+        }
+        const std::size_t destination_row =
+            static_cast<std::size_t>(destination_row_i32);
+        for (std::size_t i0 = 0; i0 < extent(source.ne[0]); ++i0) {
+            output.at(i0, destination_row) = source.at(i0, source_row);
+        }
+    }
+}
+
 void visit(Graph& graph, Tensor* tensor) {
     require_tensor(tensor, "graph output");
     if (!graph.visited.insert(tensor).second) {
@@ -177,6 +200,9 @@ const float& Tensor::at(
     const std::size_t i1,
     const std::size_t i2,
     const std::size_t i3) const {
+    if (type != Type::f32 || f32_storage == nullptr) {
+        throw std::logic_error("Tensor is not backed by F32 storage");
+    }
     const std::array<std::size_t, max_dims> index{i0, i1, i2, i3};
     std::size_t byte_offset = storage_offset_bytes;
     for (std::size_t dim = 0; dim < max_dims; ++dim) {
@@ -185,35 +211,76 @@ const float& Tensor::at(
         }
         byte_offset += index[dim] * nb[dim];
     }
-    if (byte_offset % type_size != 0 || storage == nullptr) {
+    if (byte_offset % sizeof(float) != 0) {
         throw std::logic_error("Tensor has invalid F32 storage");
     }
-    return storage->at(byte_offset / type_size);
+    return f32_storage->at(byte_offset / sizeof(float));
+}
+
+std::int32_t& Tensor::at_i32(
+    const std::size_t i0,
+    const std::size_t i1,
+    const std::size_t i2,
+    const std::size_t i3) {
+    return const_cast<std::int32_t&>(std::as_const(*this).at_i32(i0, i1, i2, i3));
+}
+
+const std::int32_t& Tensor::at_i32(
+    const std::size_t i0,
+    const std::size_t i1,
+    const std::size_t i2,
+    const std::size_t i3) const {
+    if (type != Type::i32 || i32_storage == nullptr) {
+        throw std::logic_error("Tensor is not backed by I32 storage");
+    }
+    const std::array<std::size_t, max_dims> index{i0, i1, i2, i3};
+    std::size_t byte_offset = storage_offset_bytes;
+    for (std::size_t dim = 0; dim < max_dims; ++dim) {
+        if (index[dim] >= static_cast<std::size_t>(ne[dim])) {
+            throw std::out_of_range("Tensor index is out of range");
+        }
+        byte_offset += index[dim] * nb[dim];
+    }
+    if (byte_offset % sizeof(std::int32_t) != 0) {
+        throw std::logic_error("Tensor has invalid I32 storage");
+    }
+    return i32_storage->at(byte_offset / sizeof(std::int32_t));
 }
 
 Tensor* Context::new_tensor_1d(const std::int64_t ne0, std::string name) {
-    return new_tensor({ne0, 1, 1, 1}, std::move(name));
+    return new_tensor(Type::f32, {ne0, 1, 1, 1}, std::move(name));
 }
 
 Tensor* Context::new_tensor_2d(
     const std::int64_t ne0,
     const std::int64_t ne1,
     std::string name) {
-    return new_tensor({ne0, ne1, 1, 1}, std::move(name));
+    return new_tensor(Type::f32, {ne0, ne1, 1, 1}, std::move(name));
+}
+
+Tensor* Context::new_i32_tensor_1d(const std::int64_t ne0, std::string name) {
+    return new_tensor(Type::i32, {ne0, 1, 1, 1}, std::move(name));
 }
 
 Tensor* Context::new_tensor(
+    const Type type,
     const std::array<std::int64_t, max_dims> ne,
     std::string name) {
     const std::size_t count = checked_element_count(ne);
     auto tensor = std::make_unique<Tensor>();
+    tensor->type = type;
     tensor->ne = ne;
-    tensor->nb[0] = type_size;
+    tensor->nb[0] = type_size(type);
     for (std::size_t dim = 1; dim < max_dims; ++dim) {
         tensor->nb[dim] = tensor->nb[dim - 1] * extent(ne[dim - 1]);
     }
     tensor->name = std::move(name);
-    tensor->storage = std::make_shared<std::vector<float>>(count, 0.0F);
+    if (type == Type::f32) {
+        tensor->f32_storage = std::make_shared<std::vector<float>>(count, 0.0F);
+    } else {
+        tensor->i32_storage =
+            std::make_shared<std::vector<std::int32_t>>(count, std::int32_t{0});
+    }
 
     Tensor* result = tensor.get();
     tensors_.push_back(std::move(tensor));
@@ -230,26 +297,34 @@ Tensor* Context::view_2d(
     require_tensor(source, "view source");
     const std::size_t columns = extent(ne0);
     const std::size_t rows = extent(ne1);
-    if (nb1 < columns * type_size || nb1 % type_size != 0 || offset % type_size != 0) {
+    const std::size_t element_size = type_size(source->type);
+    if (nb1 < columns * element_size ||
+        nb1 % element_size != 0 ||
+        offset % element_size != 0) {
         throw std::invalid_argument("view_2d requires aligned, non-overlapping rows");
     }
 
     const std::size_t last_byte = source->storage_offset_bytes + offset +
-        (rows - 1) * nb1 + columns * type_size;
-    const std::size_t storage_bytes = source->storage->size() * type_size;
+        (rows - 1) * nb1 + columns * element_size;
+    const std::size_t storage_elements = source->type == Type::f32
+        ? source->f32_storage->size()
+        : source->i32_storage->size();
+    const std::size_t storage_bytes = storage_elements * element_size;
     if (last_byte > storage_bytes) {
         throw std::out_of_range("view exceeds source storage");
     }
 
     auto tensor = std::make_unique<Tensor>();
+    tensor->type = source->type;
     tensor->ne = {ne0, ne1, 1, 1};
-    tensor->nb = {type_size, nb1, nb1 * rows, nb1 * rows};
+    tensor->nb = {element_size, nb1, nb1 * rows, nb1 * rows};
     tensor->op = Op::view;
     tensor->src[0] = source;
     tensor->view_src = source;
     tensor->view_offs = offset;
     tensor->name = std::move(name);
-    tensor->storage = source->storage;
+    tensor->f32_storage = source->f32_storage;
+    tensor->i32_storage = source->i32_storage;
     tensor->storage_offset_bytes = source->storage_offset_bytes + offset;
 
     Tensor* result = tensor.get();
@@ -267,7 +342,10 @@ Tensor* Context::new_elementwise_node(
     if (!can_repeat(*right, *left)) {
         throw std::invalid_argument("right tensor cannot be repeated to the left tensor shape");
     }
-    Tensor* result = new_tensor(left->ne, std::move(name));
+    if (left->type != Type::f32 || right->type != Type::f32) {
+        throw std::invalid_argument("stage07 elementwise ops require F32 tensors");
+    }
+    Tensor* result = new_tensor(Type::f32, left->ne, std::move(name));
     result->op = op;
     result->src[0] = left;
     result->src[1] = right;
@@ -304,10 +382,51 @@ Tensor* Context::rms_norm(Tensor* input, const float epsilon, std::string name) 
     if (!(epsilon > 0.0F)) {
         throw std::invalid_argument("rms_norm epsilon must be positive");
     }
-    Tensor* result = new_tensor(input->ne, std::move(name));
+    if (input->type != Type::f32) {
+        throw std::invalid_argument("rms_norm requires an F32 tensor");
+    }
+    Tensor* result = new_tensor(Type::f32, input->ne, std::move(name));
     result->op = Op::rms_norm;
     result->src[0] = input;
     std::memcpy(result->op_params.data(), &epsilon, sizeof(epsilon));
+    return result;
+}
+
+Tensor* Context::set_rows(
+    Tensor* destination,
+    Tensor* source,
+    Tensor* row_indices,
+    std::string name) {
+    require_tensor(destination, "SET_ROWS destination");
+    require_tensor(source, "SET_ROWS source");
+    require_tensor(row_indices, "SET_ROWS row indices");
+    if (destination->type != Type::f32 || source->type != Type::f32 ||
+        row_indices->type != Type::i32) {
+        throw std::invalid_argument("SET_ROWS requires F32 data and I32 indices");
+    }
+    if (destination->n_dims() > 2 || source->n_dims() > 2 ||
+        row_indices->n_dims() != 1 || destination->ne[0] != source->ne[0] ||
+        source->ne[1] != row_indices->ne[0]) {
+        throw std::invalid_argument("SET_ROWS shapes do not match");
+    }
+
+    auto tensor = std::make_unique<Tensor>();
+    tensor->type = destination->type;
+    tensor->ne = destination->ne;
+    tensor->nb = destination->nb;
+    tensor->op = Op::set_rows;
+    // 与 ggml_set_rows 保持相同的 src 顺序：source、indices、destination。
+    tensor->src[0] = source;
+    tensor->src[1] = row_indices;
+    tensor->src[2] = destination;
+    tensor->view_src = destination;
+    tensor->view_offs = 0;
+    tensor->name = std::move(name);
+    tensor->f32_storage = destination->f32_storage;
+    tensor->storage_offset_bytes = destination->storage_offset_bytes;
+
+    Tensor* result = tensor.get();
+    tensors_.push_back(std::move(tensor));
     return result;
 }
 
@@ -319,6 +438,9 @@ void Graph::clear() {
 
 void set_values(Tensor* tensor, const std::initializer_list<float> values) {
     require_tensor(tensor, "tensor");
+    if (tensor->type != Type::f32) {
+        throw std::invalid_argument("set_values requires an F32 tensor");
+    }
     if (values.size() != tensor->n_elements()) {
         throw std::invalid_argument("Value count does not match tensor shape");
     }
@@ -331,6 +453,24 @@ void set_values(Tensor* tensor, const std::initializer_list<float> values) {
         tensor->at(i0, i1, i2, i3) = *current;
         ++current;
     });
+}
+
+void set_i32_values(
+    Tensor* tensor,
+    const std::initializer_list<std::int32_t> values) {
+    require_tensor(tensor, "tensor");
+    if (tensor->type != Type::i32) {
+        throw std::invalid_argument("set_i32_values requires an I32 tensor");
+    }
+    if (values.size() != tensor->n_elements()) {
+        throw std::invalid_argument("Value count does not match tensor shape");
+    }
+
+    auto current = values.begin();
+    for (std::size_t i = 0; i < tensor->n_elements(); ++i) {
+        tensor->at_i32(i) = *current;
+        ++current;
+    }
 }
 
 void build_forward_expand(Graph& graph, Tensor* output) {
@@ -355,6 +495,9 @@ void graph_compute(Graph& graph) {
         case Op::rms_norm:
             compute_rms_norm(*node);
             break;
+        case Op::set_rows:
+            compute_set_rows(*node);
+            break;
         case Op::none:
             throw std::logic_error("A leaf Tensor was incorrectly placed in graph.nodes");
         }
@@ -369,6 +512,7 @@ const char* op_name(const Op op) noexcept {
     case Op::mul: return "MUL";
     case Op::mul_mat: return "MUL_MAT";
     case Op::rms_norm: return "RMS_NORM";
+    case Op::set_rows: return "SET_ROWS";
     }
     return "UNKNOWN";
 }

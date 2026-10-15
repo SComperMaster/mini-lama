@@ -1,0 +1,27 @@
+# Visual Studio user state
+.vs/
+*.suo
+*.user
+*.VC.db
+
+# CMake build output
+build/
+out/
+**/out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Compiled files
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+
+# OS/editor files
+.DS_Store
+Thumbs.db
